@@ -32,26 +32,37 @@ struct TokenResponse {
 
 pub async fn start_auth_process() -> Result<DeviceAuthResponse> {
     let client = Client::new();
+    // STEP 1: Scopes are required here
     let params = [("client_id", CLIENT_ID), ("scopes", "user:read:follows chat:read chat:edit")];
+
+    println!("Requesting Device Code from Twitch..."); // <--- LOGGING
 
     let resp = client.post("https://id.twitch.tv/oauth2/device")
         .form(&params).send().await?;
 
     if !resp.status().is_success() {
-        return Err(anyhow!("Failed to initiate device flow: {}", resp.text().await?));
+        let error_msg = resp.text().await?;
+        println!("Error getting code: {}", error_msg); // <--- LOGGING
+        return Err(anyhow!("Failed to initiate device flow: {}", error_msg));
     }
-    Ok(resp.json().await?)
+    
+    let data: DeviceAuthResponse = resp.json().await?;
+    println!("Device Code Received. User Code: {}", data.user_code); // <--- LOGGING
+    Ok(data)
 }
 
 pub async fn poll_for_token(device_code: String, interval_seconds: u64) -> Result<String> {
     let client = Client::new();
     let mut interval = Duration::from_secs(interval_seconds);
 
+    println!("Starting Polling Loop. Interval: {}s", interval_seconds);
+
     loop {
         sleep(interval).await;
+        
+        // STEP 2: Scopes should NOT be sent here (only client_id, device_code, grant_type)
         let params = [
             ("client_id", CLIENT_ID),
-            ("scopes", "user:read:follows chat:read chat:edit"),
             ("device_code", &device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ];
@@ -60,20 +71,36 @@ pub async fn poll_for_token(device_code: String, interval_seconds: u64) -> Resul
         let status = resp.status();
         let body = resp.text().await?;
 
+        // LOGGING: This will show you exactly what Twitch is saying
+        println!("Poll Status: {} | Body: {}", status, body); 
+
         if status.is_success() {
             let token_data: TokenResponse = serde_json::from_str(&body)?;
             save_token_securely(&token_data.access_token)?;
+            println!("LOGIN SUCCESS! Token saved.");
             return Ok("Authentication Successful".to_string());
         }
 
-        if body.contains("authorization_pending") { continue; }
-        else if body.contains("slow_down") { interval += Duration::from_secs(5); continue; }
-        else if body.contains("expired_token") { return Err(anyhow!("Code expired")); }
-        else { return Err(anyhow!("Auth Error: {}", body)); }
+        if body.contains("authorization_pending") { 
+            // Normal behavior, waiting for user
+            continue; 
+        } 
+        else if body.contains("slow_down") { 
+            println!("Twitch says slow down. Adding 5 seconds.");
+            interval += Duration::from_secs(5); 
+            continue; 
+        } 
+        else if body.contains("expired_token") { 
+            return Err(anyhow!("The login code expired. Please try again.")); 
+        } 
+        else { 
+            // If we get here, it's a real error (like 400 Bad Request)
+            return Err(anyhow!("Auth Error: {}", body)); 
+        }
     }
 }
 
-// --- STORAGE HELPERS (The Fix) ---
+// --- STORAGE HELPERS ---
 
 fn get_dev_token_path() -> PathBuf {
     let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
