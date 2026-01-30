@@ -38,32 +38,48 @@ struct StreamsResponse {
 // --- LOGIC ---
 
 pub async fn get_live_followed_channels() -> Result<Vec<Stream>> {
-    let token = get_cached_token()?;
+    println!("[API] Fetching live channels...");
+    
+    let token = get_cached_token().map_err(|_| anyhow!("Not Logged In"))?;
     let client = Client::new();
 
     // 1. Get My User ID
+    println!("[API] Requesting User ID...");
     let user_resp = client
         .get("https://api.twitch.tv/helix/users")
         .header("Client-Id", CLIENT_ID)
         .header("Authorization", format!("Bearer {}", token))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    if !user_resp.status().is_success() {
+        let err = user_resp.text().await?;
+        println!("[API] Failed to get User ID: {}", err);
+        return Err(anyhow!("Twitch API Error: {}", err));
+    }
 
     let user_data: UserResponse = user_resp.json().await?;
     let my_id = user_data.data.first().ok_or(anyhow!("No user found"))?.id.clone();
+    println!("[API] User ID Found: {}", my_id);
 
     // 2. Get Followed Streams
+    println!("[API] Requesting Followed Streams...");
     let streams_resp = client
         .get("https://api.twitch.tv/helix/streams/followed")
         .query(&[("user_id", my_id)])
         .header("Client-Id", CLIENT_ID)
         .header("Authorization", format!("Bearer {}", token))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    if !streams_resp.status().is_success() {
+        let err = streams_resp.text().await?;
+        println!("[API] Failed to get Streams: {}", err);
+        return Err(anyhow!("Twitch Stream Error: {}", err));
+    }
 
     let streams_data: StreamsResponse = streams_resp.json().await?;
+    println!("[API] Success! Found {} live streams.", streams_data.data.len());
     
     Ok(streams_data.data)
 }
