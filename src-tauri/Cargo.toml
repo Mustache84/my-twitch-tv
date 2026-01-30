@@ -6,27 +6,29 @@ authors = ["you"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
-tauri = { version = "1.6", features = ["tray-icon"] }
+# --- TAURI CORE ---
+tauri = { version = "2.0", features = ["tray-icon"] }
+tauri-plugin-log = "2.0"
+log = "0.4"
+
+# --- DATA ---
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# --- CORE LOGIC ---
+# --- ASYNC & NETWORK ---
 tokio = { version = "1", features = ["full"] } 
 anyhow = "1.0" 
-
-# --- SECURITY & AUTH ---
-keyring = "2"             
-oauth2 = "4.4"            
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-warp = "0.3"              
-open = "5.0"              # Handles opening the browser from Rust
+open = "5.0"              
+
+# --- SECURITY ---
+keyring = "2"             
 
 # --- VIDEO ENGINE ---
 libmpv = "2.0" 
 
 [features]
-# this feature is used for production builds or when `devPath` points to the filesystem
 custom-protocol = ["tauri/custom-protocol"]

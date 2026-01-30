@@ -1,109 +1,114 @@
 use anyhow::{anyhow, Result};
 use keyring::Entry;
-use oauth2::basic::BasicClient;
-use oauth2::reqwest::async_http_client;
-use oauth2::{
-    AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope, TokenResponse,
-    TokenUrl,
-};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::oneshot;
-use warp::Filter;
+use std::time::Duration;
+use tokio::time::sleep;
 
 // --- CONFIGURATION ---
-// specific service name for the OS keyring
+const CLIENT_ID: &str = "vrhsf9gxj2y4jntunres6mzber1fg1"; 
 const SERVICE_NAME: &str = "my-twitch-tv-app";
 const USER_ACCOUNT: &str = "twitch_access_token";
 
-// You will need to register an app at https://dev.twitch.tv/console
-// For now, you can use a placeholder, but the login won't fully complete without a real ID.
-const CLIENT_ID: &str = "YOUR_TWITCH_CLIENT_ID_HERE"; 
-const REDIRECT_URL: &str = "http://localhost:3000";
+// --- API STRUCTS ---
 
-#[derive(Serialize, Clone)]
-pub struct AuthState {
-    pub is_authenticated: bool,
-    pub username: Option<String>,
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DeviceAuthResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
 }
 
-pub async fn login_flow() -> Result<String> {
-    // 1. Setup OAuth Client
-    let client = BasicClient::new(
-        ClientId::new(CLIENT_ID.to_string()),
-        None, // No client secret needed for PKCE flow!
-        AuthUrl::new("https://id.twitch.tv/oauth2/authorize".to_string())?,
-        Some(TokenUrl::new("https://id.twitch.tv/oauth2/token".to_string())?),
-    )
-    .set_redirect_uri(RedirectUrl::new(REDIRECT_URL.to_string())?);
+#[derive(Deserialize, Debug)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+}
 
-    // 2. Generate PKCE Challenge (Security Best Practice)
-    // This prevents code injection attacks.
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+#[derive(Deserialize, Debug)]
+struct ErrorResponse {
+    message: String,
+}
 
-    // 3. Generate the Authorization URL
-    let (auth_url, _csrf_token) = client
-        .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new("user:read:follows".to_string())) // See live channels
-        .add_scope(Scope::new("chat:read".to_string()))         // Read chat
-        .add_scope(Scope::new("chat:edit".to_string()))         // Send chat
-        .set_pkce_challenge(pkce_challenge)
-        .url();
+// --- FLOW IMPLEMENTATION ---
 
-    // 4. Spin up a temporary local server to capture the redirect
-    let (tx, rx) = oneshot::channel::<String>();
-    let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-    let route = warp::get()
-        .and(warp::query::<Vec<(String, String)>>())
-        .map(move |params: Vec<(String, String)>| {
-            let code = params
-                .iter()
-                .find(|(k, _)| k == "code")
-                .map(|(_, v)| v.clone());
-
-            if let Some(c) = code {
-                if let Some(tx) = tx.clone().try_lock().ok().and_then(|mut guard| guard.take()) {
-                    let _ = tx.send(c);
-                }
-                return "Login successful! You can close this tab and return to the app.";
-            }
-            "Error: Missing code param."
-        });
-
-    // Spawn the server in the background
-    let server = warp::serve(route).bind(([127, 0, 0, 1], 3000));
-    let server_handle = tokio::spawn(server);
-
-    // 5. Open the User's Browser
-    println!("Opening browser to: {}", auth_url);
-    // In a real Tauri app, we use the `shell` API to open this, 
-    // but for the backend logic we can just return the URL to the frontend 
-    // or open it here if we have system access. 
-    // For now, we assume the frontend calls 'open' on this URL.
-    open::that(auth_url.to_string())?;
-
-    // 6. Wait for the redirect code
-    let code = rx.await?;
+/// Step 1: Ask Twitch for a Device Code
+pub async fn start_auth_process() -> Result<DeviceAuthResponse> {
+    let client = Client::new();
     
-    // Stop the server (the handle will be dropped, but actual shutdown depends on runtime)
-    server_handle.abort(); 
+    let params = [
+        ("client_id", CLIENT_ID),
+        ("scopes", "user:read:follows chat:read chat:edit"),
+    ];
 
-    // 7. Exchange the Authorization Code for an Access Token
-    let token_result = client
-        .exchange_code(oauth2::AuthorizationCode::new(code))
-        .set_pkce_verifier(pkce_verifier)
-        .request_async(async_http_client)
-        .await
-        .map_err(|e| anyhow!("Token exchange failed: {}", e))?;
+    let resp = client.post("https://id.twitch.tv/oauth2/device")
+        .form(&params)
+        .send()
+        .await?;
 
-    let access_token = token_result.access_token().secret();
+    if !resp.status().is_success() {
+        let err_text = resp.text().await?;
+        return Err(anyhow!("Failed to initiate device flow: {}", err_text));
+    }
 
-    // 8. Save securely to OS Keyring
-    save_token_securely(access_token)?;
-
-    Ok("Authentication Successful".to_string())
+    let auth_data: DeviceAuthResponse = resp.json().await?;
+    Ok(auth_data)
 }
+
+/// Step 2: Poll Twitch until the user approves
+pub async fn poll_for_token(device_code: String, interval_seconds: u64) -> Result<String> {
+    let client = Client::new();
+    let mut interval = Duration::from_secs(interval_seconds);
+
+    // Poll loop
+    loop {
+        sleep(interval).await;
+
+        let params = [
+            ("client_id", CLIENT_ID),
+            ("scopes", "user:read:follows chat:read chat:edit"),
+            ("device_code", &device_code),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ];
+
+        let resp = client.post("https://id.twitch.tv/oauth2/token")
+            .form(&params)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if status.is_success() {
+            // Success! We got the token.
+            let token_data: TokenResponse = serde_json::from_str(&body)?;
+            
+            // Save securely
+            save_token_securely(&token_data.access_token)?;
+            
+            return Ok("Authentication Successful".to_string());
+        }
+
+        // Handle specific OAuth errors
+        if body.contains("authorization_pending") {
+            // User hasn't clicked "Allow" yet. Keep waiting.
+            continue; 
+        } else if body.contains("slow_down") {
+            // We are polling too fast. Add 5 seconds.
+            interval += Duration::from_secs(5);
+            continue;
+        } else if body.contains("expired_token") {
+            return Err(anyhow!("The login code expired. Please try again."));
+        } else {
+            // Unknown error (denied, invalid_client, etc.)
+            return Err(anyhow!("Auth Error: {}", body));
+        }
+    }
+}
+
+// --- SECURE STORAGE ---
 
 pub fn save_token_securely(token: &str) -> Result<()> {
     let entry = Entry::new(SERVICE_NAME, USER_ACCOUNT)?;
@@ -121,7 +126,7 @@ pub fn logout() -> Result<()> {
     let entry = Entry::new(SERVICE_NAME, USER_ACCOUNT)?;
     match entry.delete_password() {
         Ok(_) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()), // Already logged out
+        Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow!(e)),
     }
 }
